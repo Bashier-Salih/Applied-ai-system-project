@@ -1,0 +1,26 @@
+# PawPal+ playful theme. Keeps native Streamlit widgets (segmented control,
+# spinners, dataframes, focus rings) in sync with the custom CSS in app.py.
+[theme]
+base = "light"
+primaryColor = "#0B7D71"            # teal — primary/interactive
+backgroundColor = "#FFF7EF"         # warm cream canvas
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#33261E"
+linkColor = "#E24E30"               # coral links
+baseRadius = "large"
+buttonRadius = "full"
+font = "Nunito:https://fonts.googleapis.com/css2?family=Nunito:wght@400;500;600;700;800&display=swap"
+headingFont = "Baloo 2:https://fonts.googleapis.com/css2?family=Baloo+2:wght@500;600;700;800&display=swap"
+codeFont = "DM Mono:https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&display=swap"
+
+# Semantic status colors (badges, dataframe cells, charts)
+greenColor = "#0B7D71"
+orangeColor = "#E08A00"
+redColor = "#E24E30"
+yellowColor = "#FFC24B"
+
+[theme.sidebar]
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#FFF3E8"
+textColor = "#33261E"
+primaryColor = "#0B7D71"
