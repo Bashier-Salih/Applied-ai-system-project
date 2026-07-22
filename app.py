@@ -3,6 +3,7 @@ from pawpal_system import Owner, Pet, Task, Scheduler
 from formatting import task_emoji, RECURRENCE_SYMBOL, PRIORITY_COLOR
 from datetime import date
 
+# ── AI Care Advisor imports (new for this project's RAG + guardrails extension) ──
 from care_advisor.advisor import CareAdvisor
 from care_advisor.retrieval import DocStore
 from care_advisor.logging_store import read_recent
@@ -12,16 +13,29 @@ PRIORITY_BADGE = {"high": "🔴 High", "medium": "🟡 Medium", "low": "🟢 Low
 
 @st.cache_resource
 def get_advisor():
-    """Cached across reruns so the TF-IDF index isn't rebuilt on every click."""
+    """Build one CareAdvisor for the whole app session.
+
+    @st.cache_resource means this function's body only runs once, even
+    though Streamlit re-runs this entire script top-to-bottom on every
+    button click / widget interaction. Without caching, every rerun would
+    reload and re-index all of knowledge/*.md from scratch, which is
+    wasteful and would slow every click down.
+    """
     return CareAdvisor(doc_store=DocStore())
 
 
 def render_advisor_response(response):
-    """Render an AdvisorResponse: answer, confidence badge, and sources."""
+    """Shared renderer for both AI features below (Q&A and Plan Review) --
+    they both return the same AdvisorResponse shape, so one function draws
+    the answer, the confidence badge, any guardrail flag, and the sources
+    expander for either one.
+    """
+    # Scope guardrail fired -- Claude was never even called for this one.
     if response.refused:
         st.warning(f"🚫 {response.answer}")
         return
 
+    # Color-coded confidence badge, from care_advisor.guardrails.confidence_score().
     confidence = response.confidence
     if confidence >= 80:
         badge = f"🟢 Confidence: {confidence}/100 (grounded)"
@@ -33,9 +47,13 @@ def render_advisor_response(response):
     st.markdown(response.answer)
     st.caption(badge)
 
+    # Grounding guardrail fired -- the model cited a source that was never
+    # retrieved, or cited nothing at all. Surfaced loudly, not hidden.
     if response.grounding and not response.grounding.grounded:
         st.error(f"⚠️ Guardrail flag: {response.grounding.reason}")
 
+    # Show exactly which knowledge-base chunks were retrieved for this
+    # query, so a reader can verify the answer against the actual source text.
     if response.retrieved:
         with st.expander(f"📚 Sources ({len(response.retrieved)})"):
             for r in response.retrieved:
@@ -216,6 +234,10 @@ if scheduler is not None:
         st.info("No tasks match this filter.")
 
     # ── AI Plan Review (advisory only — never alters the plan above) ──────
+    # This is the "review_plan()" path in care_advisor/advisor.py. It reads
+    # the already-generated `scheduler` (same object the rule-based conflict
+    # check above used) and asks Claude to flag care concerns the rule-based
+    # scheduler has no knowledge of -- it never edits `scheduler` or its plan.
     st.divider()
     st.subheader("🤖 AI Plan Review")
     st.caption(
@@ -230,11 +252,16 @@ if scheduler is not None:
                 review = get_advisor().review_plan(scheduler)
             render_advisor_response(review)
         except RuntimeError as e:
+            # Raised by CareAdvisor._ensure_client() when ANTHROPIC_API_KEY
+            # isn't set -- shown as a friendly notice instead of a crash.
             st.info(f"ℹ️ {e}")
 
 st.divider()
 
 # ── AI Care Advisor Q&A ───────────────────────────────────────────────────────
+# Free-text pet-care Q&A, independent of any specific pet/schedule. This is
+# the "answer_question()" path in care_advisor/advisor.py: scope check ->
+# retrieve -> ask Claude -> grounding check -> confidence score -> log.
 st.subheader("🩺 Ask the AI Care Advisor")
 st.caption(
     "Answers are grounded in a curated pet-care knowledge base — every claim "
@@ -255,6 +282,9 @@ if st.button("Ask"):
     except RuntimeError as e:
         st.info(f"ℹ️ {e}")
 
+# Live view into logs/interactions.jsonl (written by CareAdvisor._log() on
+# every call, including refusals) -- the audit trail for "why is this
+# trustworthy": every AI interaction is recorded, not just the successful ones.
 with st.expander("🗂 Recent AI interactions (log)"):
     recent = read_recent(10)
     if recent:

@@ -3,6 +3,10 @@
 No numpy/sklearn/vector DB — the knowledge base is small and curated, so
 dict-based term vectors and cosine similarity are sufficient, fast, and easy
 to unit test deterministically.
+
+DEMO NOTE: this is the "Retriever" box in diagrams/care_advisor_flow.mmd.
+It's the first stage of the RAG pipeline — it never talks to Claude, it
+just ranks knowledge/*.md chunks against a query using classic TF-IDF math.
 """
 
 import math
@@ -11,9 +15,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+# knowledge/ lives one level up from this file, at the project root.
 KNOWLEDGE_DIR = Path(__file__).resolve().parent.parent / "knowledge"
 
+# Matches runs of letters/digits -- used to split raw text into words.
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
+
+# Common words that carry no topical signal ("the", "and", ...). Removing
+# them keeps the TF-IDF vectors focused on words that actually distinguish
+# one chunk from another (e.g. "grooming" vs. "medication").
 _STOPWORDS = {
     "a", "an", "the", "and", "or", "but", "of", "to", "in", "on", "for",
     "is", "are", "was", "were", "be", "been", "being", "it", "its", "this",
@@ -31,6 +41,10 @@ def tokenize(text: str) -> list:
 
 @dataclass(frozen=True)
 class Chunk:
+    """One retrievable unit of knowledge: a single '## heading' section of a
+    knowledge/*.md file. `id` (e.g. "S7") is the citation marker the model
+    is required to use when it draws on this chunk's text.
+    """
     id: str
     doc_title: str
     source_file: str
@@ -40,15 +54,24 @@ class Chunk:
 
 @dataclass(frozen=True)
 class RetrievedChunk:
+    """A Chunk plus how well it matched a specific query (cosine similarity, 0-1)."""
     chunk: Chunk
     score: float
 
 
 def _parse_markdown_file(path: Path) -> list:
-    """Split a markdown file into (heading, text) sections on '## ' boundaries."""
+    """Split a markdown file into (heading, text) sections on '## ' boundaries.
+
+    Each knowledge/*.md file is one document (e.g. "Grooming Frequency") made
+    of a few '## ' sub-sections (e.g. "Bathing", "Nail trims"). Each
+    sub-section becomes one Chunk below, so a query can match a specific
+    paragraph instead of an entire document.
+    """
     text = path.read_text(encoding="utf-8")
     lines = text.splitlines()
 
+    # The doc title comes from the top-level '# Heading' line, if present,
+    # else falls back to a title-cased version of the filename.
     doc_title = path.stem.replace("_", " ").title()
     if lines and lines[0].startswith("# "):
         doc_title = lines[0][2:].strip()
@@ -59,6 +82,8 @@ def _parse_markdown_file(path: Path) -> list:
     current_lines = []
 
     def flush():
+        # Save the section we've been accumulating once we hit the next
+        # '## ' heading (or the end of the file).
         if current_heading is not None:
             body = "\n".join(current_lines).strip()
             if body:
@@ -77,7 +102,11 @@ def _parse_markdown_file(path: Path) -> list:
 
 
 class DocStore:
-    """Loads knowledge/*.md, chunks by section, and answers TF-IDF queries."""
+    """Loads knowledge/*.md, chunks by section, and answers TF-IDF queries.
+
+    This is built once (see app.py's `get_advisor()`, which caches it across
+    Streamlit reruns) and then queried many times via `retrieve()`.
+    """
 
     def __init__(self, knowledge_dir: Optional[Path] = None):
         self.knowledge_dir = Path(knowledge_dir) if knowledge_dir else KNOWLEDGE_DIR
@@ -87,8 +116,11 @@ class DocStore:
         self._load()
 
     def _load(self):
+        """Read every knowledge/*.md file and turn it into a flat list of Chunks."""
         self.chunks = []
         chunk_index = 0
+        # sorted() makes chunk ids stable across runs -- same file always
+        # gets the same "S#" id, which matters for the citation contract.
         for path in sorted(self.knowledge_dir.glob("*.md")):
             doc_title, sections = _parse_markdown_file(path)
             for heading, body in sections:
@@ -105,8 +137,16 @@ class DocStore:
         self._build_index()
 
     def _build_index(self):
-        doc_freq = {}
-        term_freqs_by_chunk = {}
+        """Build the TF-IDF vectors for every chunk, once, up front.
+
+        TF-IDF = "term frequency x inverse document frequency": a word that
+        appears often in one chunk but rarely across the whole knowledge base
+        (e.g. "bloat") gets a high weight, while a word that appears
+        everywhere (e.g. "pet") gets a low weight, since it doesn't help
+        distinguish one chunk from another.
+        """
+        doc_freq = {}              # how many chunks each word appears in
+        term_freqs_by_chunk = {}   # per-chunk word counts
 
         for chunk in self.chunks:
             tokens = tokenize(f"{chunk.heading} {chunk.text}")
@@ -117,12 +157,16 @@ class DocStore:
             for term in tf:
                 doc_freq[term] = doc_freq.get(term, 0) + 1
 
+        # Standard smoothed IDF formula: log((N+1)/(df+1)) + 1, so a word
+        # that appears in every chunk still gets a small positive weight
+        # instead of zero.
         n_docs = max(len(self.chunks), 1)
         idf = {
             term: math.log((n_docs + 1) / (df + 1)) + 1.0
             for term, df in doc_freq.items()
         }
 
+        # Each chunk's vector: for every word it contains, (count in chunk) * idf.
         chunk_vectors = {}
         for chunk_id, tf in term_freqs_by_chunk.items():
             vector = {term: count * idf[term] for term, count in tf.items()}
@@ -133,6 +177,8 @@ class DocStore:
         self._chunk_vectors = chunk_vectors
 
     def _query_vector(self, query: str) -> dict:
+        """Build the same kind of TF-IDF vector for an incoming query string,
+        reusing the IDF weights already computed from the knowledge base."""
         tokens = tokenize(query)
         tf = {}
         for token in tokens:
@@ -140,11 +186,16 @@ class DocStore:
         return {
             term: count * self._idf.get(term, 0.0)
             for term, count in tf.items()
-            if term in self._idf
+            if term in self._idf   # words never seen in the knowledge base contribute nothing
         }
 
     @staticmethod
     def _cosine_similarity(vec_a: dict, vec_b: dict) -> float:
+        """Standard cosine similarity between two sparse (dict-based) vectors:
+        dot product divided by the product of their magnitudes. Returns a
+        value in [0, 1] for these non-negative TF-IDF vectors — 0 means no
+        shared vocabulary at all, 1 means identical.
+        """
         common_terms = set(vec_a) & set(vec_b)
         if not common_terms:
             return 0.0
@@ -166,6 +217,7 @@ class DocStore:
         if not query_vector:
             return []
 
+        # Score every chunk against the query, keep only real matches (score > 0).
         scored = []
         for chunk in self.chunks:
             score = self._cosine_similarity(query_vector, self._chunk_vectors[chunk.id])
@@ -176,6 +228,8 @@ class DocStore:
         return scored[:k]
 
     def get_by_id(self, chunk_id: str) -> Optional[Chunk]:
+        """Look up a chunk by its citation id (e.g. "S7") -- used when
+        verifying that a model's citation actually refers to a real source."""
         for chunk in self.chunks:
             if chunk.id == chunk_id:
                 return chunk

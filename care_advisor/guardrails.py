@@ -2,12 +2,19 @@
 a confidence score. These are what let the AI's output be treated as
 advisory rather than authoritative -- see pawpal_system.Scheduler for the
 deterministic, always-trusted scheduling logic this layer never overrides.
+
+DEMO NOTE: this is the "Evaluator / Guardrails" box in
+diagrams/care_advisor_flow.mmd. Every one of Claude's answers passes
+through this file's functions before a user ever sees it. This is the
+"why is this trustworthy" part of the project.
 """
 
 import re
 from dataclasses import dataclass, field
 from typing import Iterable
 
+# Matches citation markers like "[S3]" that the model is required to use
+# when it draws on a specific retrieved source (see advisor.py's system prompt).
 _CITATION_RE = re.compile(r"\[S(\d+)\]")
 
 # Keyword-based emergency/diagnostic classifier. Deliberately simple and
@@ -33,12 +40,20 @@ SCOPE_REFUSAL_MESSAGE = (
 
 @dataclass(frozen=True)
 class ScopeCheck:
+    """Result of check_scope(): whether a question is safe for the AI to
+    answer at all, and why."""
     in_scope: bool
     reason: str
 
 
 def check_scope(question: str) -> ScopeCheck:
-    """Flag questions describing an active symptom/emergency for vet redirect."""
+    """Flag questions describing an active symptom/emergency for vet redirect.
+
+    GUARDRAIL #1 -- runs BEFORE retrieval or any call to Claude. If this
+    flags the question, the model is never even called (see
+    CareAdvisor.answer_question() in advisor.py) -- the refusal message is
+    deterministic, not AI-generated.
+    """
     lowered = question.lower()
     for keyword in _EMERGENCY_KEYWORDS:
         if keyword in lowered:
@@ -61,6 +76,9 @@ def extract_citations(text: str) -> list:
 
 @dataclass(frozen=True)
 class GroundingResult:
+    """Result of check_grounding(): whether a model's answer is backed by
+    real, retrieved sources (`grounded`), which ids it cited, which of those
+    citations turned out to be fake, and a human-readable reason."""
     grounded: bool
     cited_ids: list = field(default_factory=list)
     invalid_ids: list = field(default_factory=list)
@@ -69,6 +87,12 @@ class GroundingResult:
 
 def check_grounding(answer_text: str, retrieved_ids: Iterable) -> GroundingResult:
     """Verify every citation in `answer_text` matches an actually-retrieved id.
+
+    GUARDRAIL #2 -- runs AFTER Claude responds. This is the core anti-
+    hallucination check: it doesn't judge whether the *content* of the
+    answer is true, only whether every citation the model made actually
+    points at a source it was really given. A citation to an id that was
+    never retrieved for this query means the model invented a source.
 
     Grounded requires: at least one citation is present, AND every cited id
     is one of `retrieved_ids`. A response with zero citations, or one citing
@@ -97,6 +121,10 @@ def check_grounding(answer_text: str, retrieved_ids: Iterable) -> GroundingResul
 
 def confidence_score(retrieval_scores: Iterable, grounding: GroundingResult) -> int:
     """Combine retrieval similarity + grounding pass/fail into a 0-100 score.
+
+    GUARDRAIL #3 -- this is the number shown next to every answer in the UI
+    (app.py's confidence badge). It's a simple weighted sum, not a model
+    call, so it's fully deterministic given its inputs:
 
     Retrieval quality contributes up to 60 points (how well the retrieved
     chunks actually matched the query); grounding contributes the other 40

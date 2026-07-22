@@ -105,21 +105,34 @@ for pet_name, scheduler in schedulers.items():
     print()
 
 # ── AI CARE ADVISOR ────────────────────────────────────────────────────────────
+# Everything above this point is the original, unchanged Module 2 scheduler.
+# From here down is the new RAG + guardrails extension (care_advisor/).
 print(section_header("AI CARE ADVISOR (RAG + guardrails demo)"))
 
+# CareAdvisor() with no args builds its own DocStore (loads + indexes
+# knowledge/*.md) and lazily builds a real Anthropic client on first call --
+# see CareAdvisor._ensure_client() in care_advisor/advisor.py.
 advisor = CareAdvisor()
 try:
+    # 1) Free-text Q&A: retrieve -> ask Claude (citation-required prompt) ->
+    #    grounding check -> confidence score. See answer_question().
     print("\n  Q: How often should I brush a long-haired dog?")
     answer = advisor.answer_question("How often should I brush a long-haired dog?")
     print(f"  A: {answer.answer}")
     print(f"     Confidence: {answer.confidence}/100  |  Grounded: {answer.grounding.grounded}")
     print(f"     Sources: {[r.chunk.id for r in answer.retrieved]}")
 
+    # 2) Plan review: same pipeline, but the "question" is a description of
+    #    Biscuit's already-generated schedule (from the Scheduler above),
+    #    asking Claude to flag care concerns the rule-based scheduler can't
+    #    see. See review_plan() -- it never modifies schedulers["Biscuit"].
     print("\n  AI review of Biscuit's plan:")
     review = advisor.review_plan(schedulers["Biscuit"])
     print(f"  {review.answer}")
     print(f"     Confidence: {review.confidence}/100  |  Grounded: {review.grounding.grounded}")
 except RuntimeError as e:
+    # Raised when ANTHROPIC_API_KEY isn't set -- the rest of the CLI demo
+    # above still runs fine without a key; only this section needs one.
     print(f"\n  Skipped — {e}")
 
 print()

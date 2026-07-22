@@ -96,7 +96,8 @@ pip install -r requirements.txt
 # 3. (Optional) enable the AI Care Advisor
 cp .env.example .env
 # edit .env and set ANTHROPIC_API_KEY=sk-ant-...
-export $(grep -v '^#' .env | xargs)   # or use direnv / python-dotenv
+# That's it -- care_advisor/advisor.py loads .env automatically via
+# python-dotenv, so there's no need to manually export it.
 
 # 4. Run it
 streamlit run app.py     # web UI

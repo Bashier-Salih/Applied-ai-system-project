@@ -4,11 +4,26 @@ The Anthropic client is injected rather than constructed inline, so tests
 can pass a stub that returns canned text with zero network access. The
 Streamlit/CLI entry points construct the real client lazily, only when a
 question is actually asked, and surface a clear error if no API key is set.
+
+DEMO NOTE: this is the "Agent" box in diagrams/care_advisor_flow.mmd, and
+it's the orchestrator that ties the whole pipeline together. Follow
+answer_question() below top to bottom to see the full flow: scope check ->
+retrieve -> ask Claude -> grounding check -> confidence score -> log.
 """
 
 import os
 from dataclasses import dataclass, field
 from typing import Optional
+
+from dotenv import load_dotenv
+
+# Loads ANTHROPIC_API_KEY / PAWPAL_MODEL from a .env file in the project
+# root into os.environ, if one exists. `streamlit run app.py` and
+# `python main.py` don't read .env on their own, so without this, setting
+# values in .env would silently have no effect unless the caller had
+# manually exported them first. Never overrides a variable that's already
+# set in the real environment (e.g. exported in the shell or set by CI).
+load_dotenv()
 
 from care_advisor.retrieval import DocStore, RetrievedChunk
 from care_advisor.guardrails import (
@@ -27,6 +42,10 @@ NO_SOURCES_MESSAGE = (
     "confidently, so I'd rather not guess."
 )
 
+# This is the system prompt sent to Claude on every question/plan review.
+# The three rules that matter most for the guardrails downstream: (1) only
+# use the sources below, (2) cite every claim with [S#], (3) never diagnose.
+# {sources} gets filled in with the actual retrieved chunks for this query.
 SYSTEM_PROMPT_TEMPLATE = """You are the PawPal+ Care Advisor, a general pet-care assistant.
 
 Rules:
@@ -42,6 +61,8 @@ Sources:
 
 
 def _format_sources(retrieved: list) -> str:
+    """Turn retrieved chunks into the numbered "[S3] Title — Heading: text"
+    block that gets dropped into the system prompt above."""
     lines = []
     for r in retrieved:
         c = r.chunk
@@ -50,7 +71,12 @@ def _format_sources(retrieved: list) -> str:
 
 
 class AnthropicClientAdapter:
-    """Thin adapter so CareAdvisor only depends on a `.complete(system, user)` method."""
+    """Thin adapter so CareAdvisor only depends on a `.complete(system, user)` method.
+
+    This indirection is what makes the advisor testable: tests inject a
+    fake object with a `.complete()` method instead of this real one, so
+    they never make a network call to Anthropic.
+    """
 
     def __init__(self, sdk_client, model: str):
         self._client = sdk_client
@@ -70,6 +96,11 @@ class AnthropicClientAdapter:
 
 @dataclass(frozen=True)
 class AdvisorResponse:
+    """Everything the UI needs to render one Care Advisor answer: the raw
+    text, which sources backed it, whether it passed the grounding
+    guardrail, its 0-100 confidence score, and whether it was refused
+    outright by the scope guardrail before Claude was even called.
+    """
     query: str
     answer: str
     retrieved: list = field(default_factory=list)
@@ -81,11 +112,16 @@ class AdvisorResponse:
 
 class CareAdvisor:
     def __init__(self, doc_store: Optional[DocStore] = None, client=None, model: Optional[str] = None):
+        # doc_store defaults to a fresh DocStore (loads + indexes knowledge/*.md).
+        # client defaults to None and is built lazily -- see _ensure_client().
         self.doc_store = doc_store or DocStore()
         self.client = client
         self.model = model or os.environ.get("PAWPAL_MODEL", DEFAULT_MODEL)
 
     def _ensure_client(self):
+        """Build the real Anthropic client on first use, or reuse an
+        injected one (tests always pass one, so this branch never runs
+        during pytest)."""
         if self.client is not None:
             return self.client
         api_key = os.environ.get("ANTHROPIC_API_KEY")
@@ -100,6 +136,8 @@ class CareAdvisor:
         return self.client
 
     def _no_sources_response(self, query: str) -> AdvisorResponse:
+        """Used when retrieval comes back empty -- we'd rather say "I don't
+        know" than let the model answer with zero grounding available."""
         grounding = GroundingResult(grounded=False, reason="no relevant sources retrieved")
         response = AdvisorResponse(
             query=query, answer=NO_SOURCES_MESSAGE, retrieved=[],
@@ -109,6 +147,8 @@ class CareAdvisor:
         return response
 
     def _refused_response(self, query: str, scope: ScopeCheck) -> AdvisorResponse:
+        """Used when check_scope() flags the question -- note Claude is
+        never called in this path at all."""
         response = AdvisorResponse(
             query=query, answer=SCOPE_REFUSAL_MESSAGE, retrieved=[],
             grounding=None, confidence=0, refused=True, refusal_reason=scope.reason,
@@ -117,6 +157,9 @@ class CareAdvisor:
         return response
 
     def _log(self, kind: str, query: str, response: AdvisorResponse):
+        """Every path through the advisor (refusal, no-sources, or a real
+        answer) ends up here, so logs/interactions.jsonl has a complete
+        audit trail -- not just the "successful" answers."""
         append_interaction({
             "kind": kind,
             "query": query,
@@ -129,6 +172,14 @@ class CareAdvisor:
         })
 
     def answer_question(self, question: str, k: int = 4) -> AdvisorResponse:
+        """Full Q&A pipeline for a free-text pet-care question.
+
+        Step by step: (1) scope guardrail, refuse emergencies immediately;
+        (2) retrieve top-k relevant chunks; (3) bail out if nothing relevant
+        was found; (4) build the citation-required prompt and call Claude;
+        (5) grounding guardrail on the raw response; (6) confidence score;
+        (7) log everything.
+        """
         scope = check_scope(question)
         if not scope.in_scope:
             return self._refused_response(question, scope)
@@ -159,6 +210,11 @@ class CareAdvisor:
         called. This never touches scheduler.detect_conflicts() or the plan
         itself -- it only reads the plan to build a review, which the UI
         shows in a clearly separate section from the rule-based conflicts.
+
+        Same guardrail pipeline as answer_question() above, just with a
+        different "query": instead of a user's question, the query is a
+        text description of the pet + today's schedule, built from the
+        deterministic Scheduler's own data.
         """
         plan = scheduler.generated_plan
         pet = scheduler.pet
@@ -167,6 +223,7 @@ class CareAdvisor:
         if not plan:
             return self._no_sources_response(summary_label)
 
+        # Turn the Scheduler's plan into a plain-text description Claude can read.
         plan_lines = [
             f"- {t.scheduled_time} {t.name} ({t.type}, {t.duration} min, "
             f"priority={t.priority}, recurrence={t.recurrence or 'none'})"
@@ -177,6 +234,8 @@ class CareAdvisor:
             f"Today's schedule:\n" + "\n".join(plan_lines)
         )
 
+        # Retrieve using the plan's task types + species (e.g. "walk feeding dog")
+        # rather than a user-typed question, since there's no free-text query here.
         query_terms = " ".join({t.type for t in plan} | {pet.species.lower()})
         retrieved = self.doc_store.retrieve(
             f"{query_terms} schedule review care concerns", k=6
