@@ -1,0 +1,5 @@
+streamlit>=1.30
+pytest>=7.0
+tabulate>=0.9
+colorama>=0.4
+anthropic>=0.40
