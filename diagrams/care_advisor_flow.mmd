@@ -1,0 +1,39 @@
+flowchart TD
+    subgraph Human["Human (Owner)"]
+        Q[Ask a question OR click 'Build today's plan']
+        Review[Reviews AI answer + confidence + citations]
+    end
+
+    subgraph Deterministic["Deterministic Core (unchanged, always trusted)"]
+        Sched[Scheduler: prioritize / assign slots / detect_conflicts]
+    end
+
+    subgraph AI["AI Care Advisor"]
+        Retriever[Retriever: TF-IDF DocStore over knowledge/*.md]
+        Agent[Agent: Claude + citation-required prompt]
+        Evaluator[Evaluator / Guardrails: scope check -> grounding check -> confidence score]
+        Logger[(Interaction Log: logs/interactions.jsonl)]
+    end
+
+    Q -->|question text| Retriever
+    Q -->|generated plan| Sched
+    Sched -->|plan + rule-based conflicts| Agent
+    Retriever -->|top-k cited chunks| Agent
+    Agent -->|draft answer w/ citations| Evaluator
+
+    Evaluator -->|scope refusal: redirect to vet| Review
+    Evaluator -->|ungrounded: reject/flag low confidence| Review
+    Evaluator -->|grounded: answer + confidence + sources| Review
+    Evaluator --> Logger
+
+    Sched -->|rule-based conflicts, always shown separately| Review
+
+    subgraph Testing["Offline Testing (pytest, no network)"]
+        T1[test_retrieval.py: correct doc retrieved]
+        T2[test_guardrails.py: catches fake citations, flags emergencies]
+        T3[test_advisor.py: stub client checks prompt + parsing + logging]
+    end
+
+    Retriever -.verified by.-> T1
+    Evaluator -.verified by.-> T2
+    Agent -.verified by.-> T3
